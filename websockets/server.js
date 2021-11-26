@@ -1,57 +1,140 @@
-const { createServer } = require("http");
 const { WebSocketServer } = require("ws");
-const fs = require("fs/promises");
-const { constants } = require("fs");
-
-const server = createServer(function (req, res) {
-  fs.access("." + req.url, constants.R_OK)
-    .then(() => fs.readFile("." + req.url))
-    .then((data) => {
-      if (req.url.endsWith(".html")) {
-        res.writeHead(200, { "Content-Type": "text/html" });
-      }
-      if (req.url.endsWith(".js")) {
-        res.writeHead(200, {
-          "Content-Type": "application/javascript; charset=utf-8",
-        });
-      }
-      res.write(data);
-      res.end();
-    })
-    .catch(() => res.writeHead(404));
-});
-
-const sockets = {};
-const messages = {};
-const ws = new WebSocketServer({ server }, () =>
+const players = {};
+const boards = [];
+const wss = new WebSocketServer({ port: 8080 }, () =>
   console.log("Listening on port 8080")
 );
 
-ws.on("connection", (socket) => {
-  socket.id = Date.now();
-  sockets[socket.id] = socket;
-  const event = {
-    id: Date.now(),
-    type: "CONNECTED",
-    payload: { socketId: socket.id },
-  };
-  socket.send(JSON.stringify(event));
-  messages[event.id] = setTimeout(() => {
-    if (messages[event.id]) {
-      console.error("socket timeout");
-    }
-  }, 2000);
-
-  socket.on("message", (event) => {
-    event = JSON.parse(event);
-    console.log(event);
-    switch (event.type) {
-      case "ACK":
-        clearTimeout(messages[event.id]);
-        delete messages[event.id];
-        break;
-    }
+wss.on("connection", function connection(socket) {
+  socket.on("message", function message(data) {
+    console.log("received: %s", data);
+    data = JSON.parse(data);
+    manageEvent(data, socket);
   });
+
+  socket.send(JSON.stringify({ type: "CONNECTED" }));
 });
 
-server.listen(8080, () => console.log("Server is listening"));
+function manageEvent(event, socket) {
+  switch (event.type) {
+    case "JOIN":
+      players[event.username] = socket;
+      broadcastEvent({ ...event, type: "JOINED" });
+      return addToAvailableBoard(event.username);
+    case "MOVE":
+      const board = boards.find((b) => b.id === event.board);
+      if (!board)
+        return sendPlayerEvent(event.username, {
+          error: "board_not_found",
+          type: "ERROR",
+        });
+      if (board.winner)
+        return sendPlayerEvent(event.username, {
+          error: "board_match_ended",
+          type: "ERROR",
+        });
+      if (event.username !== board.players[board.turn])
+        return sendPlayerEvent(event.username, {
+          error: "invalid_player",
+          type: "ERROR",
+        });
+      if (
+        board.moves[event.x][event.y] ||
+        event.x < 0 ||
+        event.x > 2 ||
+        event.y < 0 ||
+        event.x > 2
+      )
+        return sendPlayerEvent(event.username, {
+          error: "invalid_move",
+          type: "ERROR",
+        });
+      const row = board.moves[event.x];
+      row[event.y] = event.username;
+      board.turn = (board.turn + 1) % 2;
+      sendBoardEvent(board, { board, type: "PLAYER_MOVED" });
+      const winner = checkWinnerBoard(board, event);
+      if (winner) {
+        board.winner = winner;
+        return sendBoardEvent(board, { board, type: "MATCH_END" });
+      }
+  }
+}
+function checkWinnerBoard(board, event) {
+  //check line
+  if (board.moves[event.x].filter((m) => m === event.username).length === 3)
+    return event.username;
+  let checkColumn = false;
+  for (let i = 0; i < board.moves.length; i++) {
+    if (board.moves[i][event.y] === event.username) {
+      checkColumn = true;
+    } else {
+      checkColumn = false;
+      break;
+    }
+  }
+  if (checkColumn) return event.username;
+  let checkDiago = false;
+  // Check diago left
+  for (let i = 0; i < board.moves.length; i++) {
+    if (board.moves[i][i] === event.username) {
+      checkDiago = true;
+    } else {
+      checkDiago = false;
+      break;
+    }
+  }
+  if (checkDiago) return event.username;
+  // check diago right
+  for (let i = 0; i < board.moves.length; i++) {
+    if (board.moves[i][board.moves.length - i - 1] === event.username) {
+      checkDiago = true;
+    } else {
+      checkDiago = false;
+      break;
+    }
+  }
+  if (checkDiago) return event.username;
+  if (
+    board.moves.reduce(
+      (acr, r) => acr + r.reduce((acc, c) => acc + Boolean(c), 0),
+      0
+    ) === 9
+  )
+    return "draw";
+  return false;
+}
+
+function broadcastEvent(event) {
+  Object.entries(players).forEach(
+    ([username, socket]) =>
+      username !== event.username && socket.send(JSON.stringify(event))
+  );
+}
+function sendBoardEvent(board, event) {
+  board.players.forEach((p) => players[p].send(JSON.stringify(event)));
+}
+function sendPlayerEvent(username, event) {
+  players[username].send(JSON.stringify(event));
+}
+
+function addToAvailableBoard(username) {
+  const availableBoards = boards.filter((b) => !b.isCompleted);
+  let board;
+  if (!availableBoards.length) {
+    board = {
+      id: Date.now(),
+      isCompleted: false,
+      players: [username],
+      moves: [...new Array(3)].map(() => new Array(3)),
+    };
+    boards.push(board);
+  } else {
+    board = availableBoards[0];
+    board.players.push(username);
+    board.isCompleted = true;
+    board.turn = 0;
+  }
+  sendBoardEvent(board, { board, username, type: "JOINED_BOARD" });
+  if (board.isCompleted) sendBoardEvent(board, { board, type: "MATCH_START" });
+}
